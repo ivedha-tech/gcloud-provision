@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -19,8 +20,10 @@ use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
 struct ScriptExecutionPayload {
-    script_path: String,
+    #[serde(alias = "script_path")]
+    script_url: String,
     #[serde(default)]
     args: Vec<String>,
 }
@@ -115,25 +118,25 @@ fn validate_script_path(script_path: &str, allowed_dir: &PathBuf) -> Result<Path
 }
 
 fn scan_script_for_dangerous_patterns(script_content: &str) -> Result<(), String> {
-    let dangerous_patterns = vec![
-        ("rm -rf /", "Dangerous recursive delete"),
-        ("rm -rf /*", "Dangerous recursive delete"),
-        (":(){:|:&};:", "Fork bomb detected"),
-        ("curl.*\\|.*sh", "Piped execution from web"),
-        ("wget.*\\|.*sh", "Piped execution from web"),
-        ("dd if=/dev/", "Direct disk access"),
-        ("mkfs", "Filesystem creation"),
-        ("fdisk", "Disk partitioning"),
-        ("format", "Disk formatting"),
-        ("/etc/passwd", "Access to password file"),
-        ("sudo", "Privilege escalation"),
-        ("su ", "User switching"),
-        ("chmod 777", "Dangerous permission change"),
-        ("chown", "Ownership change"),
+    let dangerous_patterns: Vec<(&str, &str)> = vec![
+        (r"rm\s+-rf\s+/", "Dangerous recursive delete"),
+        (r":\(\)\s*\{\s*:\|:&\};:", "Fork bomb detected"),
+        (r"curl.*\|.*sh", "Piped execution from web"),
+        (r"wget.*\|.*sh", "Piped execution from web"),
+        (r"\bdd\s+if=/dev/", "Direct disk access"),
+        (r"\bmkfs\b", "Filesystem creation"),
+        (r"\bfdisk\b", "Disk partitioning"),
+        (r"^\s*format\b", "Disk formatting"), // 👈 now only matches "format" as a standalone command
+        (r"/etc/passwd", "Access to password file"),
+        (r"\bsudo\b", "Privilege escalation"),
+        (r"\bsu\s", "User switching"),
+        (r"chmod\s+777", "Dangerous permission change"),
+        (r"\bchown\b", "Ownership change"),
     ];
 
     for (pattern, description) in dangerous_patterns {
-        if script_content.contains(pattern) {
+        let re = Regex::new(pattern).unwrap();
+        if re.is_match(script_content) {
             return Err(format!(
                 "Blocked dangerous pattern: {} ({})",
                 pattern, description
@@ -183,20 +186,38 @@ async fn provision(
     State(state): State<AppState>,
     Json(payload): Json<ScriptExecutionPayload>,
 ) -> Result<Json<ProvisionResponse>, (StatusCode, String)> {
-    // Validate script path
-    let script_path = match validate_script_path(&payload.script_path, &state.allowed_script_dir) {
-        Ok(path) => path,
-        Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
-    };
+    // Generate a local file path inside allowed_scripts
+    let script_filename = format!("{}.sh", Uuid::new_v4());
+    let script_path = state.allowed_script_dir.join(&script_filename);
 
-    // Validate script content
+    // Download the script from URL
+    let response = reqwest::get(&payload.script_url).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to download script: {}", e),
+        )
+    })?;
+    let content = response.text().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read script: {}", e),
+        )
+    })?;
+
+    // Save script to allowed_scripts
+    fs::write(&script_path, &content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save script: {}", e),
+        )
+    })?;
+
+    // Validate script
     if let Err(e) = validate_script(&script_path).await {
         return Err((StatusCode::BAD_REQUEST, e));
     }
 
     let job_id = Uuid::new_v4().to_string();
-
-    // Initialize job log
     {
         let mut logs = state.logs.lock().await;
         logs.insert(job_id.clone(), JobLog::default());
@@ -209,11 +230,10 @@ async fn provision(
     tokio::spawn(async move {
         let mut job_log = JobLog::default();
 
-        // Build command with arguments
         let mut cmd = Command::new("bash");
         cmd.arg(&script_path);
+
         for arg in &args {
-            // Basic validation of arguments
             if arg.contains("..") || arg.contains(';') || arg.contains('|') {
                 job_log.status = JobStatus::Failed;
                 job_log.error_message = Some("Invalid argument detected".to_string());
@@ -223,7 +243,6 @@ async fn provision(
             cmd.arg(arg);
         }
 
-        // Use spawn_blocking to run the synchronous command in a blocking thread pool
         let cmd_future = tokio::task::spawn_blocking(move || cmd.output());
 
         match timeout(Duration::from_secs(300), cmd_future).await {
