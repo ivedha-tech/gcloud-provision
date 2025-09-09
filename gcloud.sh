@@ -8,7 +8,7 @@
 set -e
 
 # Configuration Variables
-PROJECT_ID="my-webapp-project"
+PROJECT_ID="prj-dev-platform-next"
 REGION="us-central1"
 VPC_NAME="webapp-vpc"
 SUBNET_NAME="webapp-subnet"
